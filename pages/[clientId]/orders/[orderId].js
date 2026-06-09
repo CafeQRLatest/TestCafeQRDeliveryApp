@@ -1,8 +1,10 @@
 // pages/[clientId]/orders/[orderId].js
-// Step 8 — Order Detail & Tracking screen
+// Order Detail & Live Tracking screen
 //
-// Shows the full detail of a single order:
+// Shows the full detail of a single order with LIVE STATUS POLLING.
 //   • Delivery progress stepper (4 steps)
+//   • Auto-polls every 15 seconds until the order reaches a terminal state
+//     (COMPLETED / PAID / CANCELLED / VOID)
 //   • Items ordered with qty × price per line
 //   • Price breakdown
 //   • Delivery address card
@@ -12,42 +14,35 @@
 // Data from GET /api/orders/<orderId>?clientId=<uuid>
 // which proxies to the Java backend GET /api/v1/orders/{id}.
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useRouter }           from 'next/router';
 import Head                    from 'next/head';
 import {
   FiArrowLeft, FiMapPin, FiUser, FiPhone,
-  FiDollarSign, FiSmartphone, FiAlertCircle,
+  FiDollarSign, FiSmartphone, FiAlertCircle, FiRefreshCw,
 } from 'react-icons/fi';
-import { apiFetch } from '@/lib/api';
-import { useCart }  from '@/components/CartContext';
+import { apiFetch }  from '@/lib/api';
+import { useCart }   from '@/components/CartContext';
+import {
+  orderStatusToStep,
+  orderStatusLabel,
+  isTerminalStatus,
+  extractDeliveryAddress,
+} from '@/lib/deliveryHelpers';
 
-// ── Delivery progress stepper config ─────────────────────────────────────────────────
-//
-// Backend orderStatus values → step index mapping:
-//   CONFIRMED                    → step 0  (Order placed, kitchen notified)
-//   PROCESSING / IN_PROGRESS     → step 1  (Being prepared)
-//   BILLED / DISPATCHED          → step 2  (Out for delivery)
-//   COMPLETED / PAID             → step 3  (Delivered)
-//   CANCELLED / VOID             → -1      (show cancelled banner instead)
+// ── Delivery progress stepper config ──────────────────────────────────────────
 
 const STEPS = [
-  { key: 'placed',   emoji: '\uD83D\uDCDD', label: 'Order Placed',    sub: 'Kitchen notified'       },
-  { key: 'prep',     emoji: '\uD83C\uDF73', label: 'Preparing',       sub: 'Your food is being made' },
-  { key: 'dispatch', emoji: '\uD83D\uDEF5', label: 'Out for Delivery', sub: 'Rider is on the way'    },
-  { key: 'done',     emoji: '\u2705',       label: 'Delivered',        sub: 'Enjoy your meal!'       },
+  { key: 'placed',   emoji: '\uD83D\uDCDD', label: 'Order Placed',    sub: 'Kitchen notified'        },
+  { key: 'prep',     emoji: '\uD83C\uDF73', label: 'Preparing',       sub: 'Your food is being made'  },
+  { key: 'dispatch', emoji: '\uD83D\uDEF5', label: 'Out for Delivery', sub: 'Rider is on the way'     },
+  { key: 'done',     emoji: '\u2705',       label: 'Delivered',        sub: 'Enjoy your meal!'        },
 ];
 
-function statusToStep(orderStatus) {
-  const s = (orderStatus || '').toUpperCase();
-  if (['CANCELLED', 'VOID'].includes(s))       return -1;
-  if (['COMPLETED', 'PAID', 'SETTLED'].includes(s)) return 3;
-  if (['BILLED', 'DISPATCHED'].includes(s))    return 2;
-  if (['PROCESSING', 'IN_PROGRESS', 'DRAFT'].includes(s)) return 1;
-  return 0; // CONFIRMED, PENDING, or anything else → step 0
-}
+// Auto-poll interval (ms) — 15 seconds while order is active
+const POLL_INTERVAL_MS = 15_000;
 
-// ── Helpers ─────────────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
 function formatPrice(amount) {
   return new Intl.NumberFormat('en-IN', {
@@ -65,12 +60,6 @@ function formatDate(iso) {
   } catch { return iso; }
 }
 
-function extractAddress(description) {
-  if (!description) return '';
-  const match = description.match(/^DELIVERY TO:\s*/i);
-  return match ? description.slice(match[0].length).trim() : description.trim();
-}
-
 // ── Sub-components ─────────────────────────────────────────────────────────────
 
 function SectionCard({ title, children }) {
@@ -86,18 +75,28 @@ function SectionCard({ title, children }) {
   );
 }
 
-// 4-step visual stepper
-function DeliveryTracker({ step }) {
+// 4-step visual stepper with animated fill line
+function DeliveryTracker({ step, polling }) {
   return (
     <div className="bg-white rounded-2xl border border-stone-100 shadow-sm px-4 py-5">
-      <p className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-5">
-        Delivery Progress
-      </p>
+      <div className="flex items-center justify-between mb-5">
+        <p className="text-xs font-bold text-stone-400 uppercase tracking-wider">
+          Delivery Progress
+        </p>
+        {polling && (
+          <span className="flex items-center gap-1 text-[10px] text-brand-orange font-semibold">
+            <FiRefreshCw size={10} className="animate-spin" />
+            Live
+          </span>
+        )}
+      </div>
+
       <div className="relative">
-        {/* Connector line */}
+        {/* Background connector */}
         <div className="absolute top-5 left-5 right-5 h-0.5 bg-stone-100" />
+        {/* Filled progress connector */}
         <div
-          className="absolute top-5 left-5 h-0.5 bg-brand-orange transition-all duration-500"
+          className="absolute top-5 left-5 h-0.5 bg-brand-orange transition-all duration-700 ease-in-out"
           style={{ width: step <= 0 ? '0%' : `${(step / (STEPS.length - 1)) * 100}%` }}
         />
 
@@ -107,9 +106,8 @@ function DeliveryTracker({ step }) {
             const current = step === idx;
             return (
               <div key={s.key} className="flex flex-col items-center w-16">
-                {/* Circle */}
                 <div className={[
-                  'w-10 h-10 rounded-full flex items-center justify-center text-lg z-10 transition-colors duration-300',
+                  'w-10 h-10 rounded-full flex items-center justify-center text-lg z-10 transition-all duration-500',
                   done
                     ? 'bg-brand-orange text-white shadow-md'
                     : 'bg-stone-100 text-stone-300',
@@ -117,7 +115,6 @@ function DeliveryTracker({ step }) {
                 ].join(' ')}>
                   {s.emoji}
                 </div>
-                {/* Label */}
                 <p className={`text-xs font-semibold mt-2 text-center leading-tight ${
                   done ? 'text-stone-800' : 'text-stone-300'
                 }`}>
@@ -143,7 +140,9 @@ function CancelledBanner() {
       <FiAlertCircle size={20} className="text-red-500 flex-shrink-0" />
       <div>
         <p className="text-sm font-bold text-red-700">Order Cancelled</p>
-        <p className="text-xs text-red-500 mt-0.5">This order was cancelled and will not be delivered.</p>
+        <p className="text-xs text-red-500 mt-0.5">
+          This order was cancelled and will not be delivered.
+        </p>
       </div>
     </div>
   );
@@ -156,7 +155,8 @@ function PriceRow({ label, value, bold = false, highlight = false }) {
         {label}
       </span>
       <span className={`text-sm font-semibold ${
-        highlight ? 'text-brand-orange text-base font-bold' : bold ? 'text-stone-900' : 'text-stone-700'
+        highlight ? 'text-brand-orange text-base font-bold' :
+        bold      ? 'text-stone-900' : 'text-stone-700'
       }`}>
         {value}
       </span>
@@ -164,14 +164,13 @@ function PriceRow({ label, value, bold = false, highlight = false }) {
   );
 }
 
-// Skeleton loader
 function Skeleton() {
   return (
     <div className="space-y-4 animate-pulse">
       <div className="bg-white rounded-2xl p-5 space-y-3">
         <div className="h-3 bg-stone-100 rounded w-1/3" />
         <div className="flex justify-between mt-4">
-          {[1,2,3,4].map(i => (
+          {[1, 2, 3, 4].map(i => (
             <div key={i} className="flex flex-col items-center gap-2">
               <div className="w-10 h-10 rounded-full bg-stone-100" />
               <div className="h-2.5 bg-stone-100 rounded w-12" />
@@ -179,7 +178,7 @@ function Skeleton() {
           ))}
         </div>
       </div>
-      {[1,2,3].map(i => (
+      {[1, 2, 3].map(i => (
         <div key={i} className="bg-white rounded-2xl p-4 space-y-2">
           <div className="h-3 bg-stone-100 rounded w-1/4" />
           <div className="h-3 bg-stone-100 rounded w-3/4" />
@@ -190,7 +189,7 @@ function Skeleton() {
   );
 }
 
-// ── Main page ──────────────────────────────────────────────────────────────────
+// ── Main Page ──────────────────────────────────────────────────────────────────
 
 export default function OrderDetailPage() {
   const router  = useRouter();
@@ -200,27 +199,83 @@ export default function OrderDetailPage() {
   const [order,   setOrder]   = useState(null);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState(null);
+  const [polling, setPolling] = useState(false);
 
+  const pollTimerRef = useRef(null);
+
+  // ── Fetch order ────────────────────────────────────────────────────────────
+  const fetchOrder = useCallback(async (silent = false) => {
+    if (!orderId || !clientId) return;
+    if (!silent) { setLoading(true); setError(null); }
+    try {
+      const data = await apiFetch(`/orders/${orderId}`, { params: { clientId } });
+      setOrder(data);
+      setError(null);
+      return data;
+    } catch (err) {
+      if (!silent) setError(err.message || 'Failed to load order');
+      return null;
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [orderId, clientId]);
+
+  // ── Initial fetch + start polling ─────────────────────────────────────────
   useEffect(() => {
     if (!router.isReady || !orderId || !clientId) return;
-    setLoading(true);
-    setError(null);
-    apiFetch(`/orders/${orderId}`, { params: { clientId } })
-      .then(data => setOrder(data))
-      .catch(err => setError(err.message || 'Failed to load order'))
-      .finally(() => setLoading(false));
+
+    // Initial load
+    fetchOrder(false).then(data => {
+      if (!data) return;
+      // Only start polling if order is not yet in a terminal state
+      if (!isTerminalStatus(data.orderStatus)) {
+        setPolling(true);
+      }
+    });
+
+    return () => {
+      // Cleanup on unmount
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router.isReady, orderId, clientId]);
 
-  const step       = order ? statusToStep(order.orderStatus) : 0;
+  // ── Polling loop ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!polling) {
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+      return;
+    }
+
+    pollTimerRef.current = setInterval(async () => {
+      const data = await fetchOrder(true); // silent = don't show loading spinner
+      if (!data) return;
+
+      // Stop polling once the order reaches a terminal state
+      if (isTerminalStatus(data.orderStatus)) {
+        setPolling(false);
+        clearInterval(pollTimerRef.current);
+      }
+    }, POLL_INTERVAL_MS);
+
+    return () => clearInterval(pollTimerRef.current);
+  }, [polling, fetchOrder]);
+
+  // ── Derived state ──────────────────────────────────────────────────────────
+  const step        = order ? orderStatusToStep(order.orderStatus) : 0;
   const isCancelled = step === -1;
-  const address    = order ? extractAddress(order.description) : '';
-  const paymentIcon = order?.paymentMethod === 'UPI' ? FiSmartphone : FiDollarSign;
+  const address     = order ? extractDeliveryAddress(order.description) : '';
+  const paymentIcon  = order?.paymentMethod === 'UPI' ? FiSmartphone : FiDollarSign;
   const paymentLabel = order?.paymentMethod === 'UPI' ? 'UPI on Delivery' : 'Cash on Delivery';
+  const statusLabel  = order ? orderStatusLabel(order.orderStatus) : '';
 
   return (
     <>
       <Head>
-        <title>Order Detail | {clientName || 'Cafe QR Delivery'}</title>
+        <title>
+          {order?.orderNo ? `Order ${order.orderNo}` : 'Order Detail'}
+          {clientName ? ` | ${clientName}` : ' | Cafe QR Delivery'}
+        </title>
       </Head>
 
       <div className="min-h-screen bg-stone-50 pb-10">
@@ -235,20 +290,37 @@ export default function OrderDetailPage() {
             >
               <FiArrowLeft size={18} />
             </button>
-            <div>
+            <div className="flex-1 min-w-0">
               <h1 className="font-bold text-stone-900 text-base">
                 {order?.orderNo ? `Order ${order.orderNo}` : 'Order Detail'}
               </h1>
-              {order?.orderDate && (
-                <p className="text-xs text-stone-400">{formatDate(order.orderDate)}</p>
-              )}
+              <div className="flex items-center gap-2">
+                {order?.orderDate && (
+                  <p className="text-xs text-stone-400">{formatDate(order.orderDate)}</p>
+                )}
+                {statusLabel && (
+                  <span className="text-[10px] font-semibold bg-orange-50 text-brand-orange px-2 py-0.5 rounded-full">
+                    {statusLabel}
+                  </span>
+                )}
+              </div>
             </div>
+
+            {/* Manual refresh button */}
+            <button
+              type="button"
+              onClick={() => fetchOrder(false)}
+              disabled={loading}
+              className="w-9 h-9 rounded-full bg-stone-100 text-stone-600 flex items-center justify-center disabled:opacity-40"
+            >
+              <FiRefreshCw size={15} className={loading && !polling ? 'animate-spin' : ''} />
+            </button>
           </div>
         </div>
 
         <div className="px-4 pt-4 space-y-4">
 
-          {loading && <Skeleton />}
+          {loading && !order && <Skeleton />}
 
           {!loading && error && (
             <div className="flex items-start gap-2 bg-red-50 border border-red-200 rounded-2xl p-4">
@@ -257,12 +329,12 @@ export default function OrderDetailPage() {
             </div>
           )}
 
-          {!loading && order && (
+          {order && (
             <>
               {/* Cancelled banner OR delivery tracker */}
               {isCancelled
                 ? <CancelledBanner />
-                : <DeliveryTracker step={step} />
+                : <DeliveryTracker step={step} polling={polling} />
               }
 
               {/* Items */}
@@ -292,9 +364,12 @@ export default function OrderDetailPage() {
 
               {/* Price breakdown */}
               <SectionCard title="Price Breakdown">
-                <PriceRow label="Subtotal"    value={formatPrice(order.totalAmount)} />
+                <PriceRow label="Subtotal" value={formatPrice(order.totalAmount)} />
                 {order.totalDiscountAmount > 0 && (
-                  <PriceRow label="Discount" value={`− ${formatPrice(order.totalDiscountAmount)}`} />
+                  <PriceRow
+                    label="Discount"
+                    value={`− ${formatPrice(order.totalDiscountAmount)}`}
+                  />
                 )}
                 {order.totalTaxAmount > 0 && (
                   <PriceRow label="Tax" value={formatPrice(order.totalTaxAmount)} />
@@ -322,7 +397,7 @@ export default function OrderDetailPage() {
               <SectionCard title="Payment">
                 <div className="flex items-center gap-3">
                   <div className="w-9 h-9 rounded-full bg-orange-50 flex items-center justify-center flex-shrink-0">
-                    {paymentIcon === FiSmartphone
+                    {order.paymentMethod === 'UPI'
                       ? <FiSmartphone size={16} className="text-brand-orange" />
                       : <FiDollarSign  size={16} className="text-brand-orange" />
                     }
@@ -359,6 +434,16 @@ export default function OrderDetailPage() {
                     )}
                   </div>
                 </SectionCard>
+              )}
+
+              {/* Live tracking note */}
+              {polling && (
+                <div className="bg-orange-50 border border-orange-100 rounded-2xl px-4 py-3 flex items-center gap-2">
+                  <FiRefreshCw size={13} className="text-brand-orange animate-spin flex-shrink-0" />
+                  <p className="text-xs text-orange-700 font-medium">
+                    Tracking your order live — updating every 15 seconds
+                  </p>
+                </div>
               )}
 
             </>
