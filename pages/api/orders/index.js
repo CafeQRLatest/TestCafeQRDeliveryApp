@@ -15,23 +15,37 @@
 // ── Backend field mapping ─────────────────────────────────────────────────────
 // Maps to CreateOrderRequest (com.restaurant.pos.order.dto.CreateOrderRequest).
 // Key constraints discovered from source reading:
-//   • orderType     REQUIRED (NotNull) — always "SALE" for delivery
-//   • lines         REQUIRED (NotEmpty) — at least one line
+//   • orderType       REQUIRED (NotNull) — always "SALE" for delivery
+//   • lines           REQUIRED (NotEmpty) — at least one line
 //   • lines[].productId   REQUIRED (NotNull UUID)
 //   • lines[].quantity    REQUIRED (NotNull, DecimalMin 0.01)
 //   • lines[].unitPrice   REQUIRED (NotNull, DecimalMin 0.00)
-//   • orderSource   NOT a field on CreateOrderRequest — backend sets it to
-//                   "OFFLINE" via @Builder.Default on Order.java entity.
-//                   We cannot override this through the API currently.
-//   • paymentStatus "PENDING" — delivery app never settles at order time;
-//                   the store settles when the rider delivers.
+//   • orderSource     NOT a field on CreateOrderRequest — backend sets it to
+//                     "OFFLINE" via @Builder.Default on Order.java entity.
+//                     We cannot override this through the API currently.
+//   • paymentStatus   "PENDING" — delivery app never settles at order time;
+//                     the store settles when the rider delivers.
+//
+// ── Customer resolution ───────────────────────────────────────────────────────
+// customerName + customerPhone are sent as top-level fields on the request.
+// OrderService.createOrder() calls prepareCustomerFields() → resolveCustomer()
+// which:
+//   1. Looks up an existing Customer record by phone in the tenant.
+//   2. Creates a new Customer (category: REGULAR) if none found.
+//   3. Links the customer to the order via Customer.orderLinks.
+//   4. Writes customerId / customerName / customerPhone back onto the order.
+// This means repeat customers are de-duplicated automatically, and their name
+// appears on KOT / bill / POS order history.
+//
+// description carries ONLY the delivery address (no dedicated field exists in
+// CreateOrderRequest for a street address).
 //
 // ── Request body (from checkout page) ────────────────────────────────────────
-//   clientId:       string   (UUID of the store)
-//   deliveryAddress: string  (user's full address — stored in order.description)
-//   customerName:   string   (user's name)
-//   customerPhone:  string   (user's phone)
-//   paymentMethod:  string   "CASH" | "UPI"  (default: "CASH")
+//   clientId:         string   (UUID of the store)
+//   deliveryAddress:  string   (user's full address — stored in order.description)
+//   customerName:     string   (user's name — forwarded to Customer table)
+//   customerPhone:    string   (user's phone — forwarded to Customer table)
+//   paymentMethod:    string   "CASH" | "UPI"  (default: "CASH")
 //   items: [
 //     { id, name, price, quantity, variantId? }
 //   ]
@@ -90,6 +104,10 @@ export default async function handler(req, res) {
   // Normalise paymentMethod — only CASH and UPI are supported for delivery MVP
   const paymentMethod = (rawPaymentMethod === 'UPI') ? 'UPI' : 'CASH';
 
+  // Resolve name and phone — prefer explicit body values, fall back to session
+  const resolvedName  = (customerName  && customerName.trim())  || session.name  || '';
+  const resolvedPhone = (customerPhone && customerPhone.trim()) || session.phone || '';
+
   // ── Build totals ──────────────────────────────────────────────────────────
   // No tax logic in delivery MVP — taxRate=0, taxAmount=0 on every line.
   // grossLineAmount = lineTotal = qty × unitPrice (face value before discounts).
@@ -118,15 +136,19 @@ export default async function handler(req, res) {
 
   // ── Build CreateOrderRequest payload ─────────────────────────────────────
   // Field names match exactly what OrderDtoMapper.toEntity() reads.
+  //
+  // customerName + customerPhone feed OrderService.resolveCustomer() which
+  // upserts a Customer record by phone and links it to this order.
+  // description carries ONLY the delivery address.
   const payload = {
     orderType:            'SALE',
     fulfillmentType:      'DELIVERY',
     orderStatus:          'CONFIRMED',
     paymentStatus:        'PENDING',      // settled by store on delivery
     paymentMethod:        paymentMethod,
-    // description carries the delivery address + customer contact
-    // (no dedicated deliveryAddress field exists in CreateOrderRequest)
-    description:          `DELIVERY TO: ${deliveryAddress.trim()}\nName: ${customerName || session.name}\nPhone: ${customerPhone || session.phone}`,
+    customerName:         resolvedName,
+    customerPhone:        resolvedPhone,
+    description:          `DELIVERY TO: ${deliveryAddress.trim()}`,
     totalAmount:          grandTotal,
     totalTaxAmount:       0,
     totalDiscountAmount:  0,
