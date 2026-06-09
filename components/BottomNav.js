@@ -1,6 +1,6 @@
 // components/BottomNav.js
 // Fixed mobile bottom navigation bar.
-// Tabs: Home | Orders | Account
+// Tabs: Home | Orders | Profile
 // Hidden on /login and /signup (auth pages).
 // Shows a cart item count badge when there are items in the cart.
 
@@ -22,24 +22,25 @@ export default function BottomNav() {
 
   const tabs = [
     {
-      href:    '/home',
-      label:   'Home',
-      icon:    FiHome,
+      href:   '/home',
+      label:  'Home',
+      icon:   FiHome,
       // Active on /home and dynamic store/checkout routes
-      active:  pathname === '/home' || pathname.startsWith('/[clientId]'),
+      active: pathname === '/home' || pathname.startsWith('/[clientId]'),
     },
     {
-      href:    '/orders',
-      label:   'Orders',
-      icon:    FiList,
-      active:  pathname.startsWith('/orders'),
-      badge:   totalItems > 0 ? totalItems : 0,
+      href:   '/orders',
+      label:  'Orders',
+      icon:   FiList,
+      active: pathname.startsWith('/orders'),
+      badge:  totalItems > 0 ? totalItems : 0,
     },
     {
-      href:    '/account',
-      label:   'Account',
-      icon:    FiUser,
-      active:  pathname === '/account',
+      href:   '/profile',
+      label:  'Account',
+      icon:   FiUser,
+      // Active on /profile and the legacy /account alias
+      active: pathname === '/profile' || pathname === '/account',
     },
   ];
 

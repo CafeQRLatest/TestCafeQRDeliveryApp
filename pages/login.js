@@ -4,6 +4,72 @@ import { useRouter } from 'next/router';
 import Head from 'next/head';
 import { FiMail, FiArrowRight, FiShield } from 'react-icons/fi';
 
+// ── FCM token registration (best-effort, non-blocking) ──────────────────────
+// Called once after a successful login. Registers the browser/device FCM token
+// with the backend so the restaurant can send push notifications.
+// Requires NEXT_PUBLIC_FIREBASE_* env vars and the service worker to be active.
+async function registerFCMTokenAfterLogin() {
+  try {
+    // Guard: only run in browser with Notification API and service worker support
+    if (
+      typeof window === 'undefined' ||
+      !('Notification' in window) ||
+      !('serviceWorker' in navigator)
+    ) return;
+
+    // Only register if permission is already granted — don't prompt on login
+    // The user can grant permission from Profile → Notifications
+    if (Notification.permission !== 'granted') return;
+
+    // Dynamically import Firebase to avoid adding it to the initial page bundle
+    const [{ initializeApp, getApps }, { getMessaging, getToken }] =
+      await Promise.all([
+        import('firebase/app'),
+        import('firebase/messaging'),
+      ]);
+
+    const firebaseConfig = {
+      apiKey:            process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+      authDomain:        process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+      projectId:         process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+      storageBucket:     process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+      messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+      appId:             process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
+    };
+
+    // Prevent duplicate app initialisation (hot-reload safe)
+    const app = getApps().length > 0
+      ? getApps()[0]
+      : initializeApp(firebaseConfig);
+
+    const messaging = getMessaging(app);
+
+    // Register the service worker explicitly
+    const registration = await navigator.serviceWorker.register(
+      '/firebase-messaging-sw.js'
+    );
+
+    const token = await getToken(messaging, {
+      vapidKey:                    process.env.NEXT_PUBLIC_FIREBASE_VAPID_KEY,
+      serviceWorkerRegistration:   registration,
+    });
+
+    if (!token) return;
+
+    // POST the token to our Next.js API route which proxies to Spring Boot
+    await fetch('/api/notifications/register', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ token }),
+    });
+  } catch (err) {
+    // Non-fatal — FCM is best-effort. Log in dev, silent in prod.
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('[login] FCM registration skipped:', err.message);
+    }
+  }
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const { next = '/home' } = router.query;
@@ -27,9 +93,9 @@ export default function LoginPage() {
     setError(''); setLoading(true);
     try {
       const res = await fetch('/api/auth/send-otp', {
-        method: 'POST',
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email }),
+        body:    JSON.stringify({ email }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || data.message);
@@ -47,12 +113,17 @@ export default function LoginPage() {
     setError(''); setLoading(true);
     try {
       const res = await fetch('/api/auth/verify-otp', {
-        method: 'POST',
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, otp }),
+        body:    JSON.stringify({ email, otp }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
+
+      // ── Register FCM token after successful login (best-effort) ────────────
+      // Fire-and-forget: we don't await this so it never blocks navigation
+      registerFCMTokenAfterLogin();
+
       router.replace(next);
     } catch (err) {
       setError(err.message);
@@ -96,13 +167,19 @@ export default function LoginPage() {
                 type="submit" disabled={loading || !email}
                 className="w-full bg-brand-orange text-white font-semibold py-3 rounded-xl flex items-center justify-center gap-2 disabled:opacity-50"
               >
-                {loading ? <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <>
-                  Send OTP <FiArrowRight size={16} />
-                </>}
+                {loading
+                  ? <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  : <> Send OTP <FiArrowRight size={16} /></>}
               </button>
               <p className="text-center text-xs text-stone-400">
                 New user?{' '}
-                <button type="button" onClick={() => router.push(`/signup?next=${next}`)} className="text-brand-orange font-semibold">Create account</button>
+                <button
+                  type="button"
+                  onClick={() => router.push(`/signup?next=${next}`)}
+                  className="text-brand-orange font-semibold"
+                >
+                  Create account
+                </button>
               </p>
             </form>
           ) : (
@@ -128,17 +205,28 @@ export default function LoginPage() {
                 type="submit" disabled={loading || otp.length < 6}
                 className="w-full bg-brand-orange text-white font-semibold py-3 rounded-xl flex items-center justify-center gap-2 disabled:opacity-50"
               >
-                {loading ? <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> : 'Verify & Sign In'}
+                {loading
+                  ? <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  : 'Verify & Sign In'}
               </button>
               <div className="text-center">
                 {countdown > 0 ? (
                   <p className="text-xs text-stone-400">Resend in {countdown}s</p>
                 ) : (
-                  <button type="button" onClick={handleSendOtp} className="text-xs text-brand-orange font-semibold">Resend OTP</button>
+                  <button
+                    type="button"
+                    onClick={handleSendOtp}
+                    className="text-xs text-brand-orange font-semibold"
+                  >
+                    Resend OTP
+                  </button>
                 )}
               </div>
-              <button type="button" onClick={() => { setStep('email'); setOtp(''); setError(''); }}
-                className="w-full text-xs text-stone-400 text-center mt-1">
+              <button
+                type="button"
+                onClick={() => { setStep('email'); setOtp(''); setError(''); }}
+                className="w-full text-xs text-stone-400 text-center mt-1"
+              >
                 ← Change email
               </button>
             </form>
